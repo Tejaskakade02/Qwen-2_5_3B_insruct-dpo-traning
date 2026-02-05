@@ -1,3 +1,4 @@
+import os
 import torch
 from datasets import load_dataset
 from transformers import (
@@ -8,26 +9,50 @@ from transformers import (
 )
 from trl import DPOTrainer, DPOConfig
 from PIL import Image
-import os
 
+# ============================================================
+# CONFIG
+# ============================================================
 MODEL_ID = "Qwen/Qwen2-VL-2B-Instruct"
+IMAGE_ROOT = "data"                 # root folder for images
+SFT_DATA = "data/sft/train.jsonl"
+DPO_DATA = "data/dpo/train.jsonl"
 
-# ─────────────────────────────────
-# LOAD PROCESSOR + MODEL (CORRECT)
-# ─────────────────────────────────
-processor = AutoProcessor.from_pretrained(MODEL_ID)
+assert torch.cuda.is_available(), "❌ CUDA not available"
+DEVICE = "cuda"
 
-model = Qwen2VLForConditionalGeneration.from_pretrained(
+# ============================================================
+# LOAD PROCESSOR
+# ============================================================
+processor = AutoProcessor.from_pretrained(
     MODEL_ID,
-    torch_dtype="auto",
-    device_map="auto",
     trust_remote_code=True
 )
 
-# ─────────────────────────────────
+# ============================================================
+# LOAD MODEL (GPU)
+# ============================================================
+model = Qwen2VLForConditionalGeneration.from_pretrained(
+    MODEL_ID,
+    torch_dtype=torch.bfloat16,
+    device_map={"": DEVICE},
+    trust_remote_code=True
+)
+model.train()
+
+# ============================================================
+# IMAGE LOADER (SAFE)
+# ============================================================
+def load_image(rel_path: str):
+    full_path = os.path.join(IMAGE_ROOT, rel_path)
+    if not os.path.exists(full_path):
+        raise FileNotFoundError(f"Missing image: {full_path}")
+    return Image.open(full_path).convert("RGB")
+
+# ============================================================
 # SFT DATA COLLATOR
-# ─────────────────────────────────
-def vl_data_collator(batch):
+# ============================================================
+def sft_collator(batch):
     texts, images = [], []
 
     for sample in batch:
@@ -43,62 +68,59 @@ def vl_data_collator(batch):
                 "role": "user",
                 "content": [
                     {"type": "image"},
-                    {"type": "text", "text": instruction}
-                ]
+                    {"type": "text", "text": instruction},
+                ],
             },
             {
                 "role": "assistant",
-                "content": answer
-            }
+                "content": answer,
+            },
         ]
 
-        text = processor.apply_chat_template(
-            chat,
-            tokenize=False,
-            add_generation_prompt=False
+        texts.append(
+            processor.apply_chat_template(
+                chat,
+                tokenize=False,
+                add_generation_prompt=False,
+            )
         )
-
-        texts.append(text)
-        images.append(Image.open(os.path.join("data", image_path)).convert("RGB"))
+        images.append(load_image(image_path))
 
     inputs = processor(
         text=texts,
         images=images,
         padding=True,
-        return_tensors="pt"
+        return_tensors="pt",
     )
 
     inputs["labels"] = inputs["input_ids"].clone()
-    return inputs
+    return inputs   # ✅ CPU tensors only
 
-# ─────────────────────────────────
+# ============================================================
 # SFT TRAINING
-# ─────────────────────────────────
+# ============================================================
 print("\n🔥 Starting SFT training...\n")
 
-sft_dataset = load_dataset(
-    "json",
-    data_files="data/sft/train.jsonl",
-    split="train"
-)
+sft_dataset = load_dataset("json", data_files=SFT_DATA, split="train")
 
 sft_args = TrainingArguments(
     output_dir="outputs/sft",
-    per_device_train_batch_size=1,
-    gradient_accumulation_steps=8,
+    per_device_train_batch_size=2,
+    gradient_accumulation_steps=4,
     num_train_epochs=1,
     learning_rate=2e-5,
-    logging_steps=5,
-    bf16=torch.cuda.is_available(),
+    logging_steps=10,
+    bf16=True,
     remove_unused_columns=False,
-    report_to="none"
+    report_to="none",
+    gradient_checkpointing=True,
 )
 
 sft_trainer = Trainer(
     model=model,
     args=sft_args,
     train_dataset=sft_dataset,
-    data_collator=vl_data_collator
+    data_collator=sft_collator,
 )
 
 sft_trainer.train()
@@ -106,20 +128,21 @@ sft_trainer.save_model("outputs/sft")
 
 print("\n✅ SFT completed\n")
 
-# ─────────────────────────────────
+# ============================================================
 # LOAD SFT MODEL FOR DPO
-# ─────────────────────────────────
+# ============================================================
 model = Qwen2VLForConditionalGeneration.from_pretrained(
     "outputs/sft",
-    torch_dtype="auto",
-    device_map="auto",
+    torch_dtype=torch.bfloat16,
+    device_map={"": DEVICE},
     trust_remote_code=True
 )
+model.train()
 
-# ─────────────────────────────────
+# ============================================================
 # DPO DATA COLLATOR
-# ─────────────────────────────────
-def dpo_vl_collator(batch):
+# ============================================================
+def dpo_collator(batch):
     prompts, chosen, rejected, images = [], [], [], []
 
     for sample in batch:
@@ -132,21 +155,21 @@ def dpo_vl_collator(batch):
                 "role": "user",
                 "content": [
                     {"type": "image"},
-                    {"type": "text", "text": instruction}
-                ]
+                    {"type": "text", "text": instruction},
+                ],
             }
         ]
 
-        prompt = processor.apply_chat_template(
-            chat,
-            tokenize=False,
-            add_generation_prompt=True
+        prompts.append(
+            processor.apply_chat_template(
+                chat,
+                tokenize=False,
+                add_generation_prompt=True,
+            )
         )
-
-        prompts.append(prompt)
         chosen.append(sample["chosen"])
         rejected.append(sample["rejected"])
-        images.append(Image.open(os.path.join("data", image_path)).convert("RGB"))
+        images.append(load_image(image_path))
 
     return {
         "prompt": prompts,
@@ -155,25 +178,21 @@ def dpo_vl_collator(batch):
         "images": images,
     }
 
-# ─────────────────────────────────
+# ============================================================
 # DPO TRAINING
-# ─────────────────────────────────
+# ============================================================
 print("\n🔥 Starting DPO training...\n")
 
-dpo_dataset = load_dataset(
-    "json",
-    data_files="data/dpo/train.jsonl",
-    split="train"
-)
+dpo_dataset = load_dataset("json", data_files=DPO_DATA, split="train")
 
 dpo_args = DPOConfig(
     output_dir="outputs/dpo",
-    per_device_train_batch_size=1,
-    gradient_accumulation_steps=8,
+    per_device_train_batch_size=2,
+    gradient_accumulation_steps=4,
     num_train_epochs=1,
     beta=0.1,
-    logging_steps=5,
-    bf16=torch.cuda.is_available(),
+    logging_steps=10,
+    bf16=True,
     remove_unused_columns=False,
 )
 
@@ -182,10 +201,10 @@ dpo_trainer = DPOTrainer(
     ref_model=None,
     args=dpo_args,
     train_dataset=dpo_dataset,
-    data_collator=dpo_vl_collator
+    data_collator=dpo_collator,
 )
 
 dpo_trainer.train()
 dpo_trainer.save_model("outputs/dpo")
 
-print("\n🎉 SFT → DPO pipeline finished successfully")
+print("\n🎉 SFT → DPO pipeline finished successfully on GPU")
